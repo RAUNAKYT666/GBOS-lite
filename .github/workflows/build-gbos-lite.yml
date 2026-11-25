@@ -4,98 +4,116 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Run --dry-run check only first"
-        required: false
-        default: "false"
+        description: "Test workflow without downloading 7.7 GB (true/false)"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
 
 jobs:
-  build-lite:
+  build-and-boot-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    permissions:
-      contents: write
 
     steps:
-      - name: Free GitHub Runner Disk Space (~30GB reclaimed)
+      - name: Free disk space on runner
         uses: endersonmenezes/free-disk-space@v4
         with:
-          remove_android: true
-          remove_dotnet: true
-          remove_haskell: true
-          remove_tool_cache: true
-          remove_swap: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
-      - name: Check Free Disk & RAM
+      - name: Check free disk and KVM
         run: |
-          df -h /
-          free -h
+          df -h
+          ls -la /dev/kvm || echo "KVM check skipped"
 
-      - name: Use Classic Docker Storage Driver
+      - name: Clone gbos-x86 upstream
         run: |
-          echo '{"features":{"containerd-snapshotter":false}}' | sudo tee /etc/docker/daemon.json
-          sudo systemctl restart docker
+          git clone --depth 1 https://github.com/linuxkid473/gbos-x86.git gbos-src
 
-      - name: Install erofs-utils
+      - name: Dry run check
+        if: ${{ inputs.dry_run }}
+        working-directory: gbos-src
         run: |
-          sudo apt-get update
-          sudo apt-get install -y erofs-utils python3 curl git
+          GBOS_IPU6_CAMERA_BRIDGE=0 ./build.sh --dry-run
 
-      - name: Clone Official gbos-x86
+      - name: Build GBOS86 image (no IPU6 camera bridge)
+        if: ${{ !inputs.dry_run }}
+        working-directory: gbos-src
         run: |
-          git clone https://github.com/linuxkid473/gbos-x86.git
-          cd gbos-x86
-          chmod +x build.sh
-
-      - name: Dry-Run Check First
-        working-directory: gbos-x86
-        run: ./build.sh --dry-run --standard
-
-      - name: Stage A–E Build Standard Baseline First
-        if: ${{ github.event.inputs.dry_run != 'true' }}
-        working-directory: gbos-x86
-        run: ./build.sh --standard
-
-      - name: Prune Safe Optional Apps (Keep Play Store + GMS + Desktop)
-        if: ${{ github.event.inputs.dry_run != 'true' }}
-        working-directory: gbos-x86
-        run: |
-          if [ -f lapis/parts/product.img ]; then
-            cp -a lapis/parts lapis/parts.baseline
-            mkdir -p work/product work/system_ext
-            extract.erofs -i lapis/parts/product.img -x -o work/product
-            extract.erofs -i lapis/parts/system_ext.img -x -o work/system_ext
-
-            echo "=== Installed product apps before prune ==="
-            ls -1 work/product/app work/product/priv-app || true
-
-            # Remove only standalone bloat; KEEP Phonesky, GmsCore/PrebuiltGmsCore, GSF, SystemUI, Settings
-            for app in YouTube Drive Docs Sheets Slides Keep Maps Photos Velvet GoogleRestore Turbo; do
-              rm -rf "work/product/app/$app" "work/product/priv-app/$app"
-            done
-
-            mkfs.erofs -zlz4hc lapis/parts/product.img work/product && rm -rf work/product
-            mkfs.erofs -zlz4hc lapis/parts/system_ext.img work/system_ext && rm -rf work/system_ext
-            rm -rf lapis/parts.baseline
-
-            # Re-run assembly using pruned partitions
-            ./build.sh --standard
-          fi
+          yes | GBOS_IPU6_CAMERA_BRIDGE=0 ./build.sh --standard
           ls -lh dist/
 
-      - name: Split Output Image into <2GB Parts for Release
-        if: ${{ github.event.inputs.dry_run != 'true' }}
-        working-directory: gbos-x86
+      - name: Clean temporary download cache
+        if: ${{ !inputs.dry_run }}
+        working-directory: gbos-src
         run: |
-          mkdir -p release_parts
-          IMG_FILE=$(ls dist/gbOS86-*.img | head -n 1)
-          split -b 1900M "$IMG_FILE" release_parts/gbOS86-lite.part.
-          sha256sum "$IMG_FILE" release_parts/gbOS86-lite.part.* > release_parts/SHA256SUMS.txt
-          ls -lh release_parts/
+          rm -rf lapis recovery.zip *.zip || true
+          df -h
 
-      - name: Upload GBOS86 Lite Release
-        if: ${{ github.event.inputs.dry_run != 'true' }}
-        uses: softprops/action-gh-release@v2
+      - name: Install QEMU and OVMF for cloud boot test
+        if: ${{ !inputs.dry_run }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf
+          sudo chmod 666 /dev/kvm || true
+
+      - name: Boot GBOS86 on GitHub Cloud KVM and capture output
+        if: ${{ !inputs.dry_run }}
+        working-directory: gbos-src
+        run: |
+          IMG=$(ls dist/gbOS86-*.img | head -n 1)
+          echo "Testing image: $IMG"
+
+          OVMF_CODE=""
+          for p in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd; do
+            if [ -f "$p" ]; then
+              OVMF_CODE="$p"
+              break
+            fi
+          done
+          echo "Using OVMF: $OVMF_CODE"
+
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -cpu host \
+            -smp 4 \
+            -m 6G \
+            -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
+            -drive file="$IMG",format=raw,if=virtio \
+            -vga std \
+            -display none \
+            -serial file:boot-serial.log \
+            -monitor unix:/tmp/qemu-mon.sock,server,nowait \
+            -no-reboot &
+          QEMU_PID=$!
+
+          sleep 90
+
+          python3 -c '
+          import socket, time
+          s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          s.connect("/tmp/qemu-mon.sock")
+          s.sendall(b"screendump boot-screen.ppm\n")
+          time.sleep(2)
+          s.sendall(b"quit\n")
+          s.close()
+          ' || true
+
+          wait $QEMU_PID || true
+          ls -lh boot-serial.log boot-screen.ppm || true
+
+      - name: Upload boot logs and screenshot
+        if: ${{ !inputs.dry_run && always() }}
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: lite-${{ github.run_number }}
-          name: GBOS86 Lite Build #${{ github.run_number }}
-          files: gbos-x86/release_parts/*
+          name: gbos-cloud-boot-proof
+          path: |
+            gbos-src/boot-serial.log
+            gbos-src/boot-screen.ppm
+          if-no-files-found: warn
